@@ -32,11 +32,10 @@ You can deploy this server either on a cloud platform like Render.com or locally
 2. **Configure Your Web Service:**  
    - **Name:** Choose a descriptive name (e.g., `mysql-plugin-server`).  
    - **Environment:** Select **Python**.  
-   - **Branch:** Select the branch to deploy (usually `main`).  
+   - **Branch:** Select `main`.  
    - **Build Command:** `pip install -r requirements.txt`  
    - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`  
-   - **Instance Type:** Choose based on your needs (e.g., Free tier available).  
-   - **Environment Variables:** No database credentials needed here; they are provided per request by TypingMind plugin user settings.
+   - **Instance Type:** Choose based on your needs (e.g., Free tier).  
 
 3. **Create and Deploy:**  
    - Click **Create Web Service** and wait for deployment to complete.
@@ -88,7 +87,7 @@ You can deploy this server either on a cloud platform like Render.com or locally
 
 ### Required Settings for MySQL Connection
 
-- **Plugin Server URL:** The URL where this backend server is hosted (e.g., `https://your-server.com` or `http://localhost:8000`).
+- **Plugin Server URL:** The URL where this backend server is hosted (e.g., `https://your-server.render.com` or `http://localhost:8000`).
 
 - **MySQL Host:** Hostname or IP of your MySQL server (e.g., `localhost`, `db.example.com`).
 
