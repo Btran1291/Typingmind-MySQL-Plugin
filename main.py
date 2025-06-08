@@ -49,16 +49,21 @@ _engine_cache = {}
 _engine_cache_lock = Lock()
 
 def get_engine_and_session_factory(credentials: DatabaseCredentials):
+    """
+    Given DatabaseCredentials, return a tuple of (engine, metadata, SessionLocal).
+    Caches engines to avoid creating multiple engines for same credentials.
+    """
     log_connection_url_safe = (
         f"mysql+mysqlconnector://{credentials.mysql_user}:********"
-        f"@{credentials.mysql_host}:{credentials.mysql_port}"
+        f"@{credentials.mysql_host}" # Host should now contain host:port
         f"/{credentials.mysql_database}"
     )
     logger.debug(f"Attempting to connect with URL: {log_connection_url_safe}")
 
+    # This string assumes credentials.mysql_host will contain the host:port
     connection_url = (
         f"mysql+mysqlconnector://{credentials.mysql_user}:{credentials.mysql_password}"
-        f"@{credentials.mysql_host}:{credentials.mysql_port}"
+        f"@{credentials.mysql_host}" # Host should now contain host:port
         f"/{credentials.mysql_database}"
     )
 
