@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # --- Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -45,7 +45,6 @@ OPERATOR_MAP = {
     "nin": operators.notin_op,
 }
 
-# --- Connection Pooling Cache ---
 _engine_cache = {}
 _engine_cache_lock = Lock()
 
@@ -112,6 +111,7 @@ def get_engine_and_session_factory(credentials: DatabaseCredentials):
                 raise HTTPException(status_code=500, detail=f"Internal server error during database setup: {e}")
 
     return engine, metadata, SessionLocal
+
 
 # --- Validation Helpers ---
 def validate_table_exists(table_name: str, metadata: MetaData):
