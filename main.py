@@ -54,42 +54,62 @@ def get_engine_and_session_factory(credentials: DatabaseCredentials):
     Given DatabaseCredentials, return a tuple of (engine, metadata, SessionLocal).
     Caches engines to avoid creating multiple engines for same credentials.
     """
-    connection_url = (
-        f"mysql+mysqlconnector://{credentials.mysql_user}:"
-        f"{credentials.mysql_password}@{credentials.mysql_host}/"
-        f"{credentials.mysql_database}"
+    log_connection_url_safe = (
+        f"mysql+mysqlconnector://{credentials.mysql_user}:********"
+        f"@{credentials.mysql_host}" # Host should now contain host:port
+        f"/{credentials.mysql_database}"
     )
+    logger.debug(f"Attempting to connect with URL: {log_connection_url_safe}")
+
+    # This string assumes credentials.mysql_host will contain the host:port
+    connection_url = (
+        f"mysql+mysqlconnector://{credentials.mysql_user}:{credentials.mysql_password}"
+        f"@{credentials.mysql_host}" # Host should now contain host:port
+        f"/{credentials.mysql_database}"
+    )
+
     with _engine_cache_lock:
         if connection_url in _engine_cache:
             engine, metadata, SessionLocal = _engine_cache[connection_url]
-            logger.debug(f"Using cached engine for {credentials.mysql_user}@{credentials.mysql_host}/{credentials.mysql_database}")
+            logger.debug(f"Using cached engine for {log_connection_url_safe}")
         else:
             try:
+                logger.info(f"Creating new engine for {log_connection_url_safe}")
                 engine = create_engine(
                     connection_url,
                     pool_pre_ping=True,
                     pool_size=5,
                     max_overflow=10,
                     pool_recycle=3600,
-                    connect_args={"connect_timeout": 10} # Add connection timeout
+                    connect_args={"connect_timeout": 10}
                 )
+                logger.debug("Engine created. Attempting to reflect metadata...")
                 metadata = MetaData()
                 metadata.reflect(bind=engine)
+                logger.debug("Metadata reflected successfully. Creating sessionmaker...")
                 SessionLocal = sessionmaker(bind=engine)
                 _engine_cache[connection_url] = (engine, metadata, SessionLocal)
-                logger.info(f"Created and cached new engine for {credentials.mysql_user}@{credentials.mysql_host}/{credentials.mysql_database}")
-            except Exception as e:
-                logger.error(f"Failed to create or reflect database engine: {e}", exc_info=True)
-                # Provide a more specific error for connection failures
+                logger.info(f"Created and cached new engine for {log_connection_url_safe}")
+            except OperationalError as e:
+                logger.error(f"OperationalError during database connection to {log_connection_url_safe}: {e}", exc_info=True)
                 error_detail = str(e)
                 if "Access denied" in error_detail:
                      raise HTTPException(status_code=401, detail="Database authentication failed. Check credentials.")
                 elif "Unknown database" in error_detail:
                      raise HTTPException(status_code=400, detail="Database not found. Check database name.")
-                elif "Can't connect to MySQL server" in error_detail or "timed out" in error_detail:
-                     raise HTTPException(status_code=504, detail="Cannot connect to database server. Check host and network.")
+                elif "Can't connect to MySQL server" in error_detail or "timed out" in error_detail or "Connection refused" in error_detail:
+                     raise HTTPException(status_code=504, detail="Cannot connect to database server. Check host, port, and network connectivity. Is MySQL server running?")
                 else:
                      raise HTTPException(status_code=500, detail=f"Database connection error: {error_detail}")
+            except ProgrammingError as e:
+                logger.error(f"ProgrammingError during database reflection for {log_connection_url_safe}: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Database schema reflection error: {e}")
+            except SQLAlchemyError as e:
+                logger.error(f"SQLAlchemyError during database setup for {log_connection_url_safe}: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Database setup error: {e}")
+            except Exception as e:
+                logger.error(f"An unexpected error occurred during database engine setup for {log_connection_url_safe}: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Internal server error during database setup: {e}")
 
     return engine, metadata, SessionLocal
 
