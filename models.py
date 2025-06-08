@@ -5,7 +5,6 @@ from pydantic import BaseModel, Field, validator
 class DatabaseCredentials(BaseModel):
     mysql_host: str = Field(..., description="The hostname or IP address of the MySQL server")
     mysql_database: str = Field(..., description="The name of the database to connect to")
-    mysql_port: Optional[int] = Field(3306, description="The port number of the MySQL server. Defaults to 3306 if not provided.")
     mysql_user: str = Field(..., description="The username for connecting to the database")
     mysql_password: str = Field(..., description="The password for the database user")
 
