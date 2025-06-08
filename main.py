@@ -45,6 +45,8 @@ OPERATOR_MAP = {
     "nin": operators.notin_op,
 }
 
+_engine_cache = {}
+_engine_cache_lock = Lock()
 
 def get_engine_and_session_factory(credentials: DatabaseCredentials):
     log_connection_url_safe = (
