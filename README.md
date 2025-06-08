@@ -1,4 +1,3 @@
-```markdown
 # TypingMind MySQL Plugin Server 🚀
 
 This repository contains the backend server code for TypingMind plugins that enable interaction with MySQL databases. The server is built using FastAPI and SQLAlchemy, providing a dynamic and secure way to query and modify data in any MySQL database by receiving credentials directly in each request.
@@ -261,4 +260,3 @@ Provides full Create, Read, Update, and Delete capabilities, including batch ope
 ## Support & Contributions
 
 Feel free to open issues or pull requests on [GitHub](https://github.com/Btran1291/Typingmind-MySQL-Plugin) for support or to contribute improvements.
-```
