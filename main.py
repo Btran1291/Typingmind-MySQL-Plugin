@@ -145,7 +145,7 @@ def validate_columns_exist(
         except Exception as e:
              raise HTTPException(status_code=500, detail=f"Unexpected error validating column '{col_name}' in {context}: {e}")
 
-def validate_filters_exist(filters: Optional[Filters], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials): # ADD THIS PARAMETER
+def validate_filters_exist(filters: Optional[Filters], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     if not filters:
         return
     for cond in filters.conditions:
@@ -246,7 +246,25 @@ def build_filter_condition_with_alias_map(condition: FilterCondition, alias_map:
         val = f"%{val}%"
     return op_func(col, val)
 
-def apply_joins(stmt, main_table, joins: List[Join], alias_map: Dict[str, Table], credentials: DatabaseCredentials): # REMOVED METADATA PARAMETER
+def build_filters_with_alias_map(filters: Filters, alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
+    if not filters or not filters.conditions:
+        return text("1=1")
+    conditions = []
+    for cond in filters.conditions:
+        if isinstance(cond, Filters):
+            conditions.append(build_filters_with_alias_map(cond, alias_map, main_table, credentials))
+        elif isinstance(cond, FilterCondition):
+            conditions.append(build_filter_condition_with_alias_map(cond, alias_map, main_table, credentials))
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid filter condition type: {type(cond)}")
+    if filters.logic == "and":
+        return and_(*conditions)
+    elif filters.logic == "or":
+        return or_(*conditions)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported logic operator: '{filters.logic}'.")
+
+def apply_joins(stmt, main_table, joins: List[Join], alias_map: Dict[str, Table], credentials: DatabaseCredentials):
     for join in joins:
         join_table = get_aliased_table(join.table, join.alias, alias_map, credentials)
         on_clauses = []
@@ -278,7 +296,7 @@ def apply_order_by(stmt, order_by_list: Optional[List[OrderBy]], alias_map: Dict
         return stmt
     order_clauses = []
     for order in order_by_list:
-        col = get_column_from_alias_map(order.column, alias_map, main_table, credentials) # PASS CREDENTIALS HERE
+        col = get_column_from_alias_map(order.column, alias_map, main_table, credentials)
         if order.direction.lower() == "asc":
             order_clauses.append(col.asc())
         elif order.direction.lower() == "desc":
@@ -294,7 +312,7 @@ def build_aggregation_clauses(aggregations: List[Aggregation], alias_map: Dict[s
         if agg.function.lower() == "count" and agg.column is None:
             col = func.count()
         elif agg.column:
-            col = get_column_from_alias_map(agg.column, alias_map, main_table, credentials) # PASS CREDENTIALS HERE
+            col = get_column_from_alias_map(agg.column, alias_map, main_table, credentials)
             agg_func = getattr(func, agg.function.lower(), None)
             if agg_func is None:
                 raise HTTPException(status_code=400, detail=f"Unsupported aggregation function: '{agg.function}'.")
@@ -307,7 +325,7 @@ def build_aggregation_clauses(aggregations: List[Aggregation], alias_map: Dict[s
 def build_group_by_clauses(group_by_cols: List[str], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     group_by_clauses = []
     for col_name in group_by_cols:
-        col = get_column_from_alias_map(col_name, alias_map, main_table, credentials) # PASS CREDENTIALS HERE
+        col = get_column_from_alias_map(col_name, alias_map, main_table, credentials)
         group_by_clauses.append(col)
     return group_by_clauses
 
