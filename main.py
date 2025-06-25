@@ -1,10 +1,10 @@
 import logging
-import traceback # Import traceback for logging full exceptions
+import traceback
 from fastapi import FastAPI, Depends, HTTPException, Body
 from sqlalchemy import create_engine, MetaData, Table, select, and_, or_, text, func
 from sqlalchemy.orm import sessionmaker, Session, aliased
 from sqlalchemy.sql import operators
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError, ProgrammingError # Import specific DB errors
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError, ProgrammingError
 from threading import Lock
 from typing import List, Optional, Union, Dict, Any
 from models import (
@@ -48,47 +48,51 @@ OPERATOR_MAP = {
 _engine_cache = {}
 _engine_cache_lock = Lock()
 
-def get_engine_and_session_factory(credentials: DatabaseCredentials):
+def get_engine_metadata_and_session_factory(credentials: DatabaseCredentials, force_re_reflect: bool = False):
     """
     Given DatabaseCredentials, return a tuple of (engine, metadata, SessionLocal).
     Caches engines to avoid creating multiple engines for same credentials.
+    If force_re_reflect is True, it will clear and re-reflect metadata for an existing engine.
     """
     log_connection_url_safe = (
         f"mysql+mysqlconnector://{credentials.mysql_user}:********"
-        f"@{credentials.mysql_host}" # Host should now contain host:port
+        f"@{credentials.mysql_host}"
         f"/{credentials.mysql_database}"
     )
-    logger.debug(f"Attempting to connect with URL: {log_connection_url_safe}")
-
-    # This string assumes credentials.mysql_host will contain the host:port
     connection_url = (
         f"mysql+mysqlconnector://{credentials.mysql_user}:{credentials.mysql_password}"
-        f"@{credentials.mysql_host}" # Host should now contain host:port
+        f"@{credentials.mysql_host}"
         f"/{credentials.mysql_database}"
     )
 
     with _engine_cache_lock:
-        if connection_url in _engine_cache:
+        if connection_url in _engine_cache and not force_re_reflect:
             engine, metadata, SessionLocal = _engine_cache[connection_url]
             logger.debug(f"Using cached engine for {log_connection_url_safe}")
         else:
             try:
-                logger.info(f"Creating new engine for {log_connection_url_safe}")
-                engine = create_engine(
-                    connection_url,
-                    pool_pre_ping=True,
-                    pool_size=5,
-                    max_overflow=10,
-                    pool_recycle=3600,
-                    connect_args={"connect_timeout": 10}
-                )
-                logger.debug("Engine created. Attempting to reflect metadata...")
-                metadata = MetaData()
-                metadata.reflect(bind=engine)
-                logger.debug("Metadata reflected successfully. Creating sessionmaker...")
-                SessionLocal = sessionmaker(bind=engine)
+                if connection_url in _engine_cache and force_re_reflect:
+                    logger.info(f"Forcing re-reflection for existing engine: {log_connection_url_safe}")
+                    engine, metadata, SessionLocal = _engine_cache[connection_url]
+                    metadata.clear()
+                    metadata.reflect(bind=engine)
+                else:
+                    logger.info(f"Creating new engine for {log_connection_url_safe}")
+                    engine = create_engine(
+                        connection_url,
+                        pool_pre_ping=True,
+                        pool_size=5,
+                        max_overflow=10,
+                        pool_recycle=3600,
+                        connect_args={"connect_timeout": 10}
+                    )
+                    logger.debug("Engine created. Attempting to reflect metadata...")
+                    metadata = MetaData()
+                    metadata.reflect(bind=engine)
+                    logger.debug("Metadata reflected successfully. Creating sessionmaker...")
+                    SessionLocal = sessionmaker(bind=engine)
                 _engine_cache[connection_url] = (engine, metadata, SessionLocal)
-                logger.info(f"Created and cached new engine for {log_connection_url_safe}")
+                logger.info(f"Engine setup/re-reflection complete for {log_connection_url_safe}")
             except OperationalError as e:
                 logger.error(f"OperationalError during database connection to {log_connection_url_safe}: {e}", exc_info=True)
                 error_detail = str(e)
@@ -113,44 +117,42 @@ def get_engine_and_session_factory(credentials: DatabaseCredentials):
     return engine, metadata, SessionLocal
 
 
-# --- Validation Helpers ---
-def validate_table_exists(table_name: str, metadata: MetaData):
+def validate_table_exists(table_name: str, credentials: DatabaseCredentials, retry_count: int = 0):
+    _, metadata, _ = get_engine_metadata_and_session_factory(credentials, force_re_reflect=(retry_count > 0))
+
     if table_name not in metadata.tables:
-        raise HTTPException(status_code=400, detail=f"Table '{table_name}' does not exist.")
+        if retry_count < 1:
+            logger.warning(f"Table '{table_name}' not found in current metadata. Attempting to re-reflect schema.")
+            validate_table_exists(table_name, credentials, retry_count=retry_count + 1)
+        else:
+            raise HTTPException(status_code=400, detail=f"Table '{table_name}' does not exist even after schema refresh. Please ensure the table exists and credentials are correct.")
+    else:
+        logger.info(f"Table '{table_name}' found in metadata.")
+
 
 def validate_columns_exist(
     columns: List[str],
     alias_map: Dict[str, Table],
     main_table: Table,
+    credentials: DatabaseCredentials,
     context: str = "columns"
 ):
-    """
-    Validate that each column in the list exists by attempting to get its object.
-    `context` is a string used in error messages.
-    """
     for col_name in columns:
         try:
-            # Attempt to get the column object. get_column_from_alias_map raises HTTPException if not found or invalid format.
-            get_column_from_alias_map(col_name, alias_map, main_table)
+            get_column_from_alias_map(col_name, alias_map, main_table, credentials)
         except HTTPException as e:
-            # Re-raise the HTTPException with context added to the detail
             raise HTTPException(status_code=e.status_code, detail=f"Column '{col_name}' in {context} validation failed: {e.detail}")
         except Exception as e:
-             # Catch any other unexpected errors during lookup
              raise HTTPException(status_code=500, detail=f"Unexpected error validating column '{col_name}' in {context}: {e}")
 
-def validate_filters_exist(filters: Optional[Filters], alias_map: Dict[str, Table], main_table: Table):
-    """
-    Recursively validate that all columns used in filters exist by attempting to get their objects.
-    """
+def validate_filters_exist(filters: Optional[Filters], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials): # ADD THIS PARAMETER
     if not filters:
         return
     for cond in filters.conditions:
         if isinstance(cond, Filters):
-            validate_filters_exist(cond, alias_map, main_table)
+            validate_filters_exist(cond, alias_map, main_table, credentials)
         elif isinstance(cond, FilterCondition):
-            # Reuse validate_columns_exist for filter columns
-            validate_columns_exist([cond.column], alias_map, main_table, context="filter")
+            validate_columns_exist([cond.column], alias_map, main_table, credentials, context="filter")
 
 def validate_insert_data_columns(data: Dict[str, Any], table: Table):
     """
@@ -169,24 +171,30 @@ def validate_update_data_columns(data: Dict[str, Any], table: Table):
             raise HTTPException(status_code=400, detail=f"Column '{col_name}' in update data not found in table '{table.name}'.")
 
 
-# --- Helper Functions ---
-def get_table(table_name: str, metadata: MetaData) -> Table:
-    if table_name not in metadata.tables:
-        raise HTTPException(status_code=400, detail=f"Table '{table_name}' does not exist.")
-    return metadata.tables[table_name]
+def get_table(table_name: str, credentials: DatabaseCredentials) -> Table:
+    try:
+        validate_table_exists(table_name, credentials)
+        _, metadata, _ = get_engine_metadata_and_session_factory(credentials)
+        return metadata.tables[table_name]
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in get_table for '{table_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error when accessing table '{table_name}': {e}")
 
-def get_aliased_table(table_name: str, alias: Optional[str], alias_map: Dict[str, Table], metadata: MetaData) -> Table:
+
+def get_aliased_table(table_name: str, alias: Optional[str], alias_map: Dict[str, Table], credentials: DatabaseCredentials) -> Table:
     if alias:
         if alias in alias_map:
             return alias_map[alias]
-        base_table = get_table(table_name, metadata)
+        base_table = get_table(table_name, credentials)
         aliased_table = aliased(base_table, name=alias)
         alias_map[alias] = aliased_table
         return aliased_table
     else:
-        return get_table(table_name, metadata)
+        return get_table(table_name, credentials)
 
-def get_column_from_alias_map(col_name: str, alias_map: Dict[str, Table], main_table: Table):
+def get_column_from_alias_map(col_name: str, alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     parts = col_name.split(".")
     if len(parts) == 2:
         alias_or_table, column = parts
@@ -200,7 +208,19 @@ def get_column_from_alias_map(col_name: str, alias_map: Dict[str, Table], main_t
                 raise HTTPException(status_code=400, detail=f"Column '{column}' not found in alias/table '{alias_or_table}'.")
             return aliased_table.c[column]
         else:
-            raise HTTPException(status_code=400, detail=f"Alias or table '{alias_or_table}' not found.")
+            try:
+                base_table_for_alias = get_table(alias_or_table, credentials)
+                aliased_table = aliased(base_table_for_alias, name=alias_or_table)
+                alias_map[alias_or_table] = aliased_table
+
+                if column not in aliased_table.c:
+                    raise HTTPException(status_code=400, detail=f"Column '{column}' not found in newly reflected alias/table '{alias_or_table}'.")
+                return aliased_table.c[column]
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Unexpected error resolving column '{col_name}' after potential re-reflection: {e}")
+
     elif len(parts) == 1:
         column = parts[0]
         if column in main_table.c:
@@ -212,8 +232,8 @@ def get_column_from_alias_map(col_name: str, alias_map: Dict[str, Table], main_t
     else:
         raise HTTPException(status_code=400, detail=f"Invalid column name format: '{col_name}'")
 
-def build_filter_condition_with_alias_map(condition: FilterCondition, alias_map: Dict[str, Table], main_table: Table):
-    col = get_column_from_alias_map(condition.column, alias_map, main_table)
+def build_filter_condition_with_alias_map(condition: FilterCondition, alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
+    col = get_column_from_alias_map(condition.column, alias_map, main_table, credentials)
     op_func = OPERATOR_MAP.get(condition.operator)
     if op_func is None:
         raise HTTPException(status_code=400, detail=f"Unsupported operator: '{condition.operator}'.")
@@ -226,31 +246,13 @@ def build_filter_condition_with_alias_map(condition: FilterCondition, alias_map:
         val = f"%{val}%"
     return op_func(col, val)
 
-def build_filters_with_alias_map(filters: Filters, alias_map: Dict[str, Table], main_table: Table):
-    if not filters or not filters.conditions:
-        return text("1=1")
-    conditions = []
-    for cond in filters.conditions:
-        if isinstance(cond, Filters):
-            conditions.append(build_filters_with_alias_map(cond, alias_map, main_table))
-        elif isinstance(cond, FilterCondition):
-            conditions.append(build_filter_condition_with_alias_map(cond, alias_map, main_table))
-        else:
-            raise HTTPException(status_code=400, detail=f"Invalid filter condition type: {type(cond)}")
-    if filters.logic == "and":
-        return and_(*conditions)
-    elif filters.logic == "or":
-        return or_(*conditions)
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported logic operator: '{filters.logic}'.")
-
-def apply_joins(stmt, main_table, joins: List[Join], alias_map: Dict[str, Table], metadata: MetaData):
+def apply_joins(stmt, main_table, joins: List[Join], alias_map: Dict[str, Table], credentials: DatabaseCredentials): # REMOVED METADATA PARAMETER
     for join in joins:
-        join_table = get_aliased_table(join.table, join.alias, alias_map, metadata)
+        join_table = get_aliased_table(join.table, join.alias, alias_map, credentials)
         on_clauses = []
         for left_col, right_col in join.on.items():
-            left_column = get_column_from_alias_map(left_col, alias_map, main_table)
-            right_column = get_column_from_alias_map(right_col, alias_map, main_table)
+            left_column = get_column_from_alias_map(left_col, alias_map, main_table, credentials)
+            right_column = get_column_from_alias_map(right_col, alias_map, main_table, credentials)
             on_clauses.append(left_column == right_column)
         on_condition = and_(*on_clauses)
         join_type = join.type or "inner"
@@ -258,28 +260,25 @@ def apply_joins(stmt, main_table, joins: List[Join], alias_map: Dict[str, Table]
             stmt = stmt.join(join_table, on_condition)
         elif join_type == "left":
             stmt = stmt.outerjoin(join_table, on_condition)
-        # TODO: Add support for right and full outer joins if needed
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported join type: {join_type}")
         if join.columns:
-            # Validate columns in join.columns
-            validate_columns_exist(join.columns, alias_map, join_table, context=f"join '{join.alias or join.table}' columns")
+            validate_columns_exist(join.columns, alias_map, join_table, credentials, context=f"join '{join.alias or join.table}' columns")
             cols = [join_table.c[col] for col in join.columns]
             stmt = stmt.add_columns(*cols)
         if join.filters:
-            # Validate filters in join.filters
-            validate_filters_exist(join.filters, alias_map, join_table)
-            filter_condition = build_filters_with_alias_map(join.filters, alias_map, join_table)
+            validate_filters_exist(join.filters, alias_map, join_table, credentials)
+            filter_condition = build_filters_with_alias_map(join.filters, alias_map, join_table, credentials)
             stmt = stmt.where(filter_condition)
     return stmt
 
-def apply_order_by(stmt, order_by_list: Optional[List[OrderBy]], alias_map: Dict[str, Table], main_table: Table):
+
+def apply_order_by(stmt, order_by_list: Optional[List[OrderBy]], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     if not order_by_list:
         return stmt
     order_clauses = []
     for order in order_by_list:
-        # Validation for order by columns is done before calling this function
-        col = get_column_from_alias_map(order.column, alias_map, main_table)
+        col = get_column_from_alias_map(order.column, alias_map, main_table, credentials) # PASS CREDENTIALS HERE
         if order.direction.lower() == "asc":
             order_clauses.append(col.asc())
         elif order.direction.lower() == "desc":
@@ -288,14 +287,14 @@ def apply_order_by(stmt, order_by_list: Optional[List[OrderBy]], alias_map: Dict
             raise HTTPException(status_code=400, detail=f"Invalid order direction: {order.direction}")
     return stmt.order_by(*order_clauses)
 
-def build_aggregation_clauses(aggregations: List[Aggregation], alias_map: Dict[str, Table], main_table: Table):
+
+def build_aggregation_clauses(aggregations: List[Aggregation], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     agg_clauses = []
     for agg in aggregations:
         if agg.function.lower() == "count" and agg.column is None:
             col = func.count()
         elif agg.column:
-            # Validation for aggregation columns is done before calling this function
-            col = get_column_from_alias_map(agg.column, alias_map, main_table)
+            col = get_column_from_alias_map(agg.column, alias_map, main_table, credentials) # PASS CREDENTIALS HERE
             agg_func = getattr(func, agg.function.lower(), None)
             if agg_func is None:
                 raise HTTPException(status_code=400, detail=f"Unsupported aggregation function: '{agg.function}'.")
@@ -305,11 +304,10 @@ def build_aggregation_clauses(aggregations: List[Aggregation], alias_map: Dict[s
         agg_clauses.append(col.label(agg.alias))
     return agg_clauses
 
-def build_group_by_clauses(group_by_cols: List[str], alias_map: Dict[str, Table], main_table: Table):
+def build_group_by_clauses(group_by_cols: List[str], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     group_by_clauses = []
     for col_name in group_by_cols:
-        # Validation for group by columns is done before calling this function
-        col = get_column_from_alias_map(col_name, alias_map, main_table)
+        col = get_column_from_alias_map(col_name, alias_map, main_table, credentials) # PASS CREDENTIALS HERE
         group_by_clauses.append(col)
     return group_by_clauses
 
@@ -317,9 +315,10 @@ def build_group_by_clauses(group_by_cols: List[str], alias_map: Dict[str, Table]
 async def root():
     return {"message": "TypingMind MySQL API is running"}
 
+
 @app.post("/schema")
 async def get_schema(credentials: DatabaseCredentials):
-    engine, metadata, _ = get_engine_and_session_factory(credentials)
+    engine, metadata, _ = get_engine_metadata_and_session_factory(credentials, force_re_reflect=True)
     schema_data = []
     try:
         for table_name, table in metadata.tables.items():
@@ -367,153 +366,108 @@ async def get_schema(credentials: DatabaseCredentials):
         logger.error(f"Error retrieving database schema: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error retrieving database schema: {e}")
 
-
 @app.post("/query")
 async def run_query(query: Query = Body(...)):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(query.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(query.credentials)
     db = SessionLocal()
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(query.table, metadata)
-        main_table = get_table(query.table, metadata) # Get table object after validation
+        validate_table_exists(query.table, query.credentials)
+        main_table = get_table(query.table, query.credentials)
 
         alias_map = {main_table.name: main_table}
         if query.joins:
-            # Populate alias_map early and validate join tables
             for join in query.joins:
-                validate_table_exists(join.table, metadata) # Validate joined table exists
-                get_aliased_table(join.table, join.alias, alias_map, metadata) # Populate alias_map
+                validate_table_exists(join.table, query.credentials)
+                get_aliased_table(join.table, join.alias, alias_map, query.credentials)
 
-        # Validate columns in 'columns' field if present
         if query.columns:
-            validate_columns_exist(query.columns, alias_map, main_table, context="columns")
+            validate_columns_exist(query.columns, alias_map, main_table, query.credentials, context="columns")
 
-        # Validate filters
-        validate_filters_exist(query.filters, alias_map, main_table)
+        validate_filters_exist(query.filters, alias_map, main_table, query.credentials)
 
-        # Validate columns in group_by if present
         if query.group_by:
-            validate_columns_exist(query.group_by, alias_map, main_table, context="group_by")
+            validate_columns_exist(query.group_by, alias_map, main_table, query.credentials, context="group_by")
 
-        # Validate columns in order_by if present
         if query.order_by:
             order_by_cols = [order.column for order in query.order_by]
-            validate_columns_exist(order_by_cols, alias_map, main_table, context="order_by")
+            validate_columns_exist(order_by_cols, alias_map, main_table, query.credentials, context="order_by")
 
-        # Validate columns in aggregations if present
         if query.aggregations:
             agg_cols = [agg.column for agg in query.aggregations if agg.column]
             if agg_cols:
-                validate_columns_exist(agg_cols, alias_map, main_table, context="aggregations")
+                validate_columns_exist(agg_cols, alias_map, main_table, query.credentials, context="aggregations")
 
-        # --- Build select_items based on Aggregation/Grouping or Standard Query ---
         select_items = []
         is_aggregating = query.aggregations is not None and len(query.aggregations) > 0
         is_grouping = query.group_by is not None and len(query.group_by) > 0
 
         if is_aggregating or is_grouping:
             if is_grouping:
-                group_by_clauses = build_group_by_clauses(query.group_by, alias_map, main_table)
+                group_by_clauses = build_group_by_clauses(query.group_by, alias_map, main_table, query.credentials)
                 select_items.extend(group_by_clauses)
             if is_aggregating:
-                agg_clauses = build_aggregation_clauses(query.aggregations, alias_map, main_table)
+                agg_clauses = build_aggregation_clauses(query.aggregations, alias_map, main_table, query.credentials)
                 select_items.extend(agg_clauses)
             if query.columns is not None and len(query.columns) > 0:
                 raise HTTPException(status_code=400, detail="The 'columns' field cannot be used when 'aggregations' or 'group_by' are specified. Selected columns are defined by 'group_by' and 'aggregations'.")
         else:
             if query.columns:
-                select_items = [get_column_from_alias_map(col, alias_map, main_table) for col in query.columns]
+                select_items = [get_column_from_alias_map(col, alias_map, main_table, query.credentials) for col in query.columns]
             else:
                 select_items = [main_table]
 
-        # --- Build the select statement ---
         stmt = select(*select_items).select_from(main_table)
 
-        # --- Apply Joins ---
         if query.joins:
-            stmt = apply_joins(stmt, main_table, query.joins, alias_map, metadata)
+            stmt = apply_joins(stmt, main_table, query.joins, alias_map, query.credentials)
 
-        # --- Apply Filters ---
         if query.filters:
-            stmt = stmt.where(build_filters_with_alias_map(query.filters, alias_map, main_table))
+            stmt = stmt.where(build_filters_with_alias_map(query.filters, alias_map, main_table, query.credentials))
 
-        # --- Apply Group By ---
         if is_grouping:
              stmt = stmt.group_by(*group_by_clauses)
 
-
-        # --- Apply Sorting ---
         if query.order_by:
-            stmt = apply_order_by(stmt, query.order_by, alias_map, main_table)
+            stmt = apply_order_by(stmt, query.order_by, alias_map, main_table, query.credentials)
 
-
-        # --- Apply Pagination ---
         if query.limit is not None:
             stmt = stmt.limit(query.limit)
         if query.offset:
             stmt = stmt.offset(query.offset)
 
-
-        # --- DEBUGGING PRINT STATEMENTS (Optional for Production) ---
-        # print("\n--- Generated SQL Statement ---")
-        # print(stmt)
-        # print("-----------------------------\n")
-        # --- END DEBUGGING ---
-
-        # Execute the query
         result = db.execute(stmt)
 
-        # --- DEBUGGING PRINT STATEMENTS (Optional for Production) ---
-        # print("\n--- Raw Query Result ---")
-        # raw_rows = result.fetchall()
-        # print(raw_rows)
-        # print("------------------------\n")
-        # --- END DEBUGGING ---
-
-        # Fetch results and convert to list of dictionaries
-        # Use result.keys() to get column names for dictionary keys
-        # If using raw_rows from debugging, uncomment and use: rows = [dict(zip(result.keys(), row)) for row in raw_rows]
         rows = [dict(zip(result.keys(), row)) for row in result]
-
 
         return {"data": rows}
 
     except HTTPException as e:
-        # Re-raise HTTP exceptions for FastAPI to handle
         raise e
     except Exception as e:
-        # Catch any other unexpected errors during query building or execution
         logger.error(f"Unexpected error during query execution: {e}", exc_info=True)
-        # Provide a more user-friendly error message
         detail = str(e)
-        # Catch common MySQL error for non-aggregated columns in select without group by
         if "1055" in detail or "GROUP BY" in detail:
              detail = "Query error: SELECT list contains nonaggregated column which is not included in GROUP BY clause."
-        # Catch common MySQL error for unknown column
         elif "Unknown column" in detail:
-             detail = f"Query error: {detail}" # Keep the specific column name from the DB error
-        # Catch common MySQL syntax error
+             detail = f"Query error: {detail}"
         elif "syntax error" in detail:
-             detail = f"Query error: {detail}" # Keep the specific syntax error
+             detail = f"Query error: {detail}"
         else:
-             detail = "An internal server error occurred." # Generic error for others
+             detail = "An internal server error occurred."
 
         raise HTTPException(status_code=500, detail=detail)
     finally:
-        # Ensure the session is closed
         if db:
             db.close()
 
-
 @app.post("/insert")
 async def insert_data(item: Insert):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
-        validate_insert_data_columns(item.data, table) # Validate columns in data
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
+        validate_insert_data_columns(item.data, table)
 
         stmt = table.insert().values(**item.data)
         result = db.execute(stmt)
@@ -545,13 +499,11 @@ async def insert_data(item: Insert):
 
 @app.post("/batch/insert")
 async def batch_insert_data(item: BatchInsert):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
-        # Validate columns in data for each item in the batch (assuming consistent schema)
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
         if item.data:
              for row_data in item.data:
                   validate_insert_data_columns(row_data, table)
@@ -592,20 +544,17 @@ async def batch_insert_data(item: BatchInsert):
 
 @app.post("/update")
 async def update_data(item: Update):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
-        validate_update_data_columns(item.data, table) # Validate columns in data
-        # Validate filters (uses alias_map, but for update/delete it's empty)
-        validate_filters_exist(item.filters, {}, table)
-
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
+        validate_update_data_columns(item.data, table)
+        validate_filters_exist(item.filters, {}, table, item.credentials)
 
         stmt = table.update()
         if item.filters:
-            filter_condition = build_filters_with_alias_map(item.filters, {}, table)
+            filter_condition = build_filters_with_alias_map(item.filters, {}, table, item.credentials)
             stmt = stmt.where(filter_condition)
         stmt = stmt.values(**item.data)
         result = db.execute(stmt)
@@ -628,28 +577,25 @@ async def update_data(item: Update):
 
 @app.post("/batch/update")
 async def batch_update_data(item: BatchUpdate):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     total_rows_affected = 0
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
         if not item.updates:
             logger.info(f"No update specifications provided for table '{item.table}'.")
             return {
                 "message": f"No update specifications provided for table '{item.table}'.",
                 "total_rows_affected": 0
             }
-        # Validate columns and filters for each update item
         for update_item in item.updates:
              validate_update_data_columns(update_item.data, table)
-             validate_filters_exist(update_item.filters, {}, table)
-
+             validate_filters_exist(update_item.filters, {}, table, item.credentials)
 
         for update_item in item.updates:
             stmt = table.update()
-            filter_condition = build_filters_with_alias_map(update_item.filters, {}, table)
+            filter_condition = build_filters_with_alias_map(update_item.filters, {}, table, item.credentials)
             stmt = stmt.where(filter_condition)
             stmt = stmt.values(**update_item.data)
             result = db.execute(stmt)
@@ -682,18 +628,15 @@ async def batch_update_data(item: BatchUpdate):
 
 @app.post("/delete")
 async def delete_data(item: Delete):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
-        # Validate filters (filters are required by Pydantic model)
-        validate_filters_exist(item.filters, {}, table)
-
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
+        validate_filters_exist(item.filters, {}, table, item.credentials)
 
         stmt = table.delete()
-        filter_condition = build_filters_with_alias_map(item.filters, {}, table)
+        filter_condition = build_filters_with_alias_map(item.filters, {}, table, item.credentials)
         stmt = stmt.where(filter_condition)
         result = db.execute(stmt)
         db.commit()
@@ -717,29 +660,27 @@ async def delete_data(item: Delete):
         if db:
             db.close()
 
+
 @app.post("/batch/delete")
 async def batch_delete_data(item: BatchDelete):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     total_rows_affected = 0
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
         if not item.deletions:
             logger.info(f"No delete specifications provided for table '{item.table}'.")
             return {
                 "message": f"No delete specifications provided for table '{item.table}'.",
                 "total_rows_affected": 0
             }
-        # Validate filters for each delete item
         for delete_item in item.deletions:
-             validate_filters_exist(delete_item.filters, {}, table)
-
+             validate_filters_exist(delete_item.filters, {}, table, item.credentials)
 
         for delete_item in item.deletions:
             stmt = table.delete()
-            filter_condition = build_filters_with_alias_map(delete_item.filters, {}, table)
+            filter_condition = build_filters_with_alias_map(delete_item.filters, {}, table, item.credentials)
             stmt = stmt.where(filter_condition)
             result = db.execute(stmt)
             total_rows_affected += result.rowcount
@@ -771,19 +712,16 @@ async def batch_delete_data(item: BatchDelete):
 
 @app.post("/count")
 async def count_data(item: Count):
-    engine, metadata, SessionLocal = get_engine_and_session_factory(item.credentials)
+    engine, _, SessionLocal = get_engine_metadata_and_session_factory(item.credentials)
     db = SessionLocal()
     try:
-        # --- Explicit Input Validation ---
-        validate_table_exists(item.table, metadata)
-        table = get_table(item.table, metadata) # Get table object after validation
-        # Validate filters
-        validate_filters_exist(item.filters, {}, table)
-
+        validate_table_exists(item.table, item.credentials)
+        table = get_table(item.table, item.credentials)
+        validate_filters_exist(item.filters, {}, table, item.credentials)
 
         stmt = select(func.count()).select_from(table)
         if item.filters:
-            filter_condition = build_filters_with_alias_map(item.filters, {}, table)
+            filter_condition = build_filters_with_alias_map(item.filters, {}, table, item.credentials)
             stmt = stmt.where(filter_condition)
 
         result = db.execute(stmt)
@@ -794,7 +732,7 @@ async def count_data(item: Count):
             "count": count_value
         }
     except HTTPException as e:
-        db.rollback() # Rollback is not strictly needed for reads, but harmless
+        db.rollback()
         raise e
     except SQLAlchemyError as e:
         db.rollback()
