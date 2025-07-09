@@ -8,14 +8,13 @@ This repository contains the backend server code for TypingMind plugins that ena
 
 This server is designed to work with the following TypingMind plugins. You will need to install these plugins in your TypingMind application:
 
-1. **MySQL Schema**  
-   [https://cloud.typingmind.com/plugins/p-01JT8R2C7YC00QXN0Q0PF8SQ6F](https://cloud.typingmind.com/plugins/p-01JT8R2C7YC00QXN0Q0PF8SQ6F)
+1. [**MySQL Schema**](https://cloud.typingmind.com/plugins/p-01JZPTRSR34C5WZ49KT1VKSSB0)  
 
-2. **MySQL Query**  
-   [https://cloud.typingmind.com/plugins/p-01JT8R2TV312878TKY5A0MNYYQ](https://cloud.typingmind.com/plugins/p-01JT8R2TV312878TKY5A0MNYYQ)
+2. [**MySQL Query**](https://cloud.typingmind.com/plugins/p-01JZPTSC33PV6AJVTTWGH9KPGP)  
 
-3. **MySQL CRUD Operation**  
-   [https://cloud.typingmind.com/plugins/p-01JT8R37PFQ7C3562X51E7JBCV](https://cloud.typingmind.com/plugins/p-01JT8R37PFQ7C3562X51E7JBCV)
+3. [**MySQL CRUD Operation**](https://cloud.typingmind.com/plugins/p-01JZPTSXS1JZD0J5YPNRKVR8PV)  
+
+4. [**MySQL DDL Operation**](https://cloud.typingmind.com/plugins/p-01JZPTNSGK71TCYNTGFX27Q5ZS)
 
 ---
 
