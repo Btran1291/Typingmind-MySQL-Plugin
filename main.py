@@ -1,16 +1,27 @@
 import logging
 import traceback
+import re
 from fastapi import FastAPI, Depends, HTTPException, Body
 from sqlalchemy import create_engine, MetaData, Table, select, and_, or_, text, func
 from sqlalchemy.orm import sessionmaker, Session, aliased
 from sqlalchemy.sql import operators
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError, ProgrammingError
+from sqlalchemy.schema import CreateTable as SQLACreateTable
+from sqlalchemy.schema import DropTable as SQLADropTable
+from sqlalchemy.schema import PrimaryKeyConstraint
+from sqlalchemy import (
+    Column, Integer, String, Boolean, DateTime, Float, Text, Date, Time, LargeBinary, JSON,
+    SmallInteger, BigInteger, Numeric
+)
+from sqlalchemy.dialects import mysql
 from threading import Lock
 from typing import List, Optional, Union, Dict, Any
 from models import (
     Query, Filters, FilterCondition, Join, OrderBy, Insert, Update, Delete,
     Aggregation, Count, BatchInsert, BatchUpdateItem, BatchUpdate,
-    BatchDeleteItem, BatchDelete, DatabaseCredentials
+    BatchDeleteItem, BatchDelete, DatabaseCredentials,
+    CreateTable, ColumnDefinition, DropTable, TruncateTable, RenameTable,
+    AddColumn, DropColumn, RenameColumn, ModifyColumn
 )
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -125,7 +136,7 @@ def validate_table_exists(table_name: str, credentials: DatabaseCredentials, ret
             logger.warning(f"Table '{table_name}' not found in current metadata. Attempting to re-reflect schema.")
             validate_table_exists(table_name, credentials, retry_count=retry_count + 1)
         else:
-            raise HTTPException(status_code=400, detail=f"Table '{table_name}' does not exist even after schema refresh. Please ensure the table exists and credentials are correct.")
+            raise HTTPException(status_code=400, detail=f"Table '{table_name}' not found or does not exist. Please ensure the table exists and credentials are correct.")
     else:
         logger.info(f"Table '{table_name}' found in metadata.")
 
@@ -763,3 +774,633 @@ async def count_data(item: Count):
     finally:
         if db:
             db.close()
+
+def map_sql_type_to_sqlalchemy_type(sql_type: str):
+    sql_type_upper = sql_type.upper().strip()
+
+    match = re.match(r"([A-Z]+)(?:\s*\(([^)]*)\))?", sql_type_upper)
+    if not match:
+        raise HTTPException(status_code=400, detail=f"Invalid SQL data type format: {sql_type}")
+
+    base_type = match.group(1)
+    params_str = match.group(2)
+
+    if base_type == "VARCHAR":
+        if not params_str or not params_str.isdigit():
+            raise HTTPException(status_code=400, detail=f"Invalid VARCHAR length: {sql_type}. Expected VARCHAR(length).")
+        return String(int(params_str))
+    elif base_type == "CHAR":
+        if not params_str or not params_str.isdigit():
+            raise HTTPException(status_code=400, detail=f"Invalid CHAR length: {sql_type}. Expected CHAR(length).")
+        return String(int(params_str))
+    elif base_type in ("DECIMAL", "NUMERIC"):
+        if not params_str:
+            raise HTTPException(status_code=400, detail=f"Invalid {base_type} format: {sql_type}. Expected {base_type}(precision,scale).")
+        parts = [p.strip() for p in params_str.split(',')]
+        try:
+            precision = int(parts[0])
+            scale = int(parts[1]) if len(parts) > 1 else 0
+            return mysql.DECIMAL(precision, scale)
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail=f"Invalid {base_type} precision/scale: {sql_type}. Expected {base_type}(precision,scale).")
+    elif base_type == "ENUM":
+        if not params_str:
+            raise HTTPException(status_code=400, detail=f"Invalid ENUM format: {sql_type}. Expected ENUM('val1','val2').")
+        enum_values = re.findall(r"'([^']*)'", params_str)
+        if not enum_values:
+             raise HTTPException(status_code=400, detail=f"Invalid ENUM values format: {sql_type}. Expected ENUM('val1','val2').")
+        return mysql.ENUM(*enum_values)
+    elif base_type == "SET":
+        if not params_str:
+            raise HTTPException(status_code=400, detail=f"Invalid SET format: {sql_type}. Expected SET('val1','val2').")
+        set_values = re.findall(r"'([^']*)'", params_str)
+        if not set_values:
+             raise HTTPException(status_code=400, detail=f"Invalid SET values format: {sql_type}. Expected SET('val1','val2').")
+        return mysql.SET(*set_values)
+
+    elif base_type in ("INT", "INTEGER"):
+        return Integer
+    elif base_type == "TINYINT":
+        return SmallInteger
+    elif base_type == "SMALLINT":
+        return SmallInteger
+    elif base_type == "MEDIUMINT":
+        return Integer
+    elif base_type == "BIGINT":
+        return BigInteger
+    elif base_type == "BOOLEAN":
+        return Boolean
+    elif base_type in ("DATETIME", "TIMESTAMP"):
+        return DateTime
+    elif base_type in ("FLOAT", "DOUBLE", "DOUBLE PRECISION"):
+        return Float
+    elif base_type in ("TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT"):
+        return Text
+    elif base_type == "DATE":
+        return Date
+    elif base_type == "TIME":
+        return Time
+    elif base_type in ("BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB"):
+        return LargeBinary
+    elif base_type == "JSON":
+        return JSON
+    elif base_type == "YEAR":
+        return SmallInteger
+    elif base_type in ("BINARY", "VARBINARY"):
+        if not params_str or not params_str.isdigit():
+            raise HTTPException(status_code=400, detail=f"Invalid {base_type} length: {sql_type}. Expected {base_type}(length).")
+        return LargeBinary(int(params_str))
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported SQL data type: {sql_type}")
+@app.post("/create_table")
+async def create_table(item: CreateTable = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+    try:
+        if item.table_name in metadata.tables:
+            if item.if_not_exists:
+                logger.info(f"Table '{item.table_name}' already exists. Skipping creation due to if_not_exists=True.")
+                return {"message": f"Table '{item.table_name}' already exists. No action taken."}
+            else:
+                raise HTTPException(status_code=409, detail=f"Table '{item.table_name}' already exists. Use if_not_exists=True to suppress this error.")
+
+        columns_for_table = []
+        for col_def in item.columns:
+            sa_type = map_sql_type_to_sqlalchemy_type(col_def.type)
+            column = Column(
+                col_def.name,
+                sa_type,
+                nullable=col_def.nullable,
+                primary_key=col_def.primary_key,
+                autoincrement=col_def.autoincrement,
+                default=col_def.default,
+                unique=col_def.unique
+            )
+            columns_for_table.append(column)
+
+        new_table = Table(item.table_name, metadata, *columns_for_table)
+
+        create_stmt = SQLACreateTable(new_table, if_not_exists=item.if_not_exists)
+
+        with engine.connect() as connection:
+            connection.execute(create_stmt)
+            connection.commit()
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Table '{item.table_name}' created successfully.")
+        return {"message": f"Table '{item.table_name}' created successfully."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during table creation: {e}", exc_info=True)
+        if "table exists" in str(e).lower() and not item.if_not_exists:
+            raise HTTPException(status_code=409, detail=f"Table '{item.table_name}' already exists. Use if_not_exists=True to suppress this error.")
+        raise HTTPException(status_code=500, detail=f"Database error during table creation: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during table creation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during table creation: {e}")
+
+@app.post("/drop_table")
+async def drop_table(item: DropTable = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+    try:
+        if item.table_name not in metadata.tables:
+            if item.if_exists:
+                logger.info(f"Table '{item.table_name}' does not exist. Skipping drop due to if_exists=True.")
+                return {"message": f"Table '{item.table_name}' does not exist. No action taken."}
+            else:
+                raise HTTPException(status_code=404, detail=f"Table '{item.table_name}' not found.")
+
+        table_to_drop = metadata.tables[item.table_name]
+
+        drop_stmt = SQLADropTable(table_to_drop, if_exists=item.if_exists)
+
+        with engine.connect() as connection:
+            connection.execute(drop_stmt)
+            connection.commit()
+
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Table '{item.table_name}' dropped successfully.")
+        return {"message": f"Table '{item.table_name}' dropped successfully."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during table drop: {e}", exc_info=True)
+        if "unknown table" in str(e).lower() and not item.if_exists:
+            raise HTTPException(status_code=404, detail=f"Table '{item.table_name}' not found.")
+        raise HTTPException(status_code=500, detail=f"Database error during table drop: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during table drop: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during table drop: {e}")
+
+@app.post("/truncate_table")
+async def truncate_table(item: TruncateTable = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials)
+
+    try:
+        validate_table_exists(item.table_name, item.credentials)
+        
+        truncate_stmt = text(f"TRUNCATE TABLE `{item.table_name}`")
+
+        with engine.connect() as connection:
+            connection.execute(truncate_stmt)
+            connection.commit()
+
+        logger.info(f"Table '{item.table_name}' truncated successfully.")
+        return {"message": f"Table '{item.table_name}' truncated successfully."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during table truncation: {e}", exc_info=True)
+        if "unknown table" in str(e).lower() or "doesn't exist" in str(e).lower():
+            raise HTTPException(status_code=404, detail=f"Table '{item.table_name}' not found or does not exist.")
+        raise HTTPException(status_code=500, detail=f"Database error during table truncation: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during table truncation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during table truncation: {e}")
+
+@app.post("/add_column")
+async def add_column(item: AddColumn = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+    try:
+        validate_table_exists(item.table_name, item.credentials)
+        table_to_alter = metadata.tables[item.table_name]
+
+        # Check if column already exists in the table's reflected columns
+        if item.column_definition.name in table_to_alter.columns:
+            if item.if_not_exists:
+                logger.info(f"Column '{item.column_definition.name}' already exists in table '{item.table_name}'. Skipping addition due to if_not_exists=True.")
+                return {"message": f"Column '{item.column_definition.name}' already exists in table '{item.table_name}'. No action taken."}
+            else:
+                raise HTTPException(status_code=409, detail=f"Column '{item.column_definition.name}' already exists in table '{item.table_name}'. Use if_not_exists=True to suppress this error.")
+
+        # Construct the column definition string for SQL
+        column_sql_definition = (
+            f"`{item.column_definition.name}` {item.column_definition.type}"
+            f"{' NOT NULL' if not item.column_definition.nullable else ''}"
+            f"{' PRIMARY KEY' if item.column_definition.primary_key else ''}"
+            f"{' AUTO_INCREMENT' if item.column_definition.autoincrement else ''}"
+            f"{f' DEFAULT {repr(item.column_definition.default)}' if item.column_definition.default is not None else ''}"
+            f"{' UNIQUE' if item.column_definition.unique else ''}"
+        )
+
+        # Construct the ALTER TABLE ADD COLUMN statement using text()
+        if_not_exists_clause = " IF NOT EXISTS" if item.if_not_exists else ""
+        alter_table_stmt = text(
+            f"ALTER TABLE `{item.table_name}` ADD COLUMN {column_sql_definition}{if_not_exists_clause}"
+        )
+
+        with engine.connect() as connection:
+            connection.execute(alter_table_stmt)
+            connection.commit()
+
+        # After altering the table, force re-reflection of metadata to include the new column
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Column '{item.column_definition.name}' added successfully to table '{item.table_name}'.")
+        return {"message": f"Column '{item.column_definition.name}' added successfully to table '{item.table_name}'."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during add column: {e}", exc_info=True)
+        # More robust check for "duplicate column name" or similar errors
+        error_message_lower = str(e).lower()
+        if ("duplicate column name" in error_message_lower or "column already exists" in error_message_lower) and not item.if_not_exists:
+            raise HTTPException(status_code=409, detail=f"Column '{item.column_definition.name}' already exists in table '{item.table_name}'. Use if_not_exists=True to suppress this error.")
+        raise HTTPException(status_code=500, detail=f"Database error during add column: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during add column: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during add column: {e}")
+
+@app.post("/drop_column")
+async def drop_column(item: DropColumn = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+    try:
+        # Validate table exists
+        validate_table_exists(item.table_name, item.credentials)
+        table_to_alter = metadata.tables[item.table_name]
+
+        # Check if column exists in the table's reflected columns
+        if item.column_name not in table_to_alter.columns:
+            if item.if_exists:
+                logger.info(f"Column '{item.column_name}' does not exist in table '{item.table_name}'. Skipping drop due to if_exists=True.")
+                return {"message": f"Column '{item.column_name}' does not exist in table '{item.table_name}'. No action taken."}
+            else:
+                raise HTTPException(status_code=404, detail=f"Column '{item.column_name}' not found in table '{item.table_name}'.")
+
+        # Construct the ALTER TABLE DROP COLUMN statement using text()
+        if_exists_clause = " IF EXISTS" if item.if_exists else ""
+        alter_table_stmt = text(
+            f"ALTER TABLE `{item.table_name}` DROP COLUMN `{item.column_name}`{if_exists_clause}"
+        )
+
+        with engine.connect() as connection:
+            connection.execute(alter_table_stmt)
+            connection.commit()
+
+        # After altering the table, force re-reflection of metadata to remove the column
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Column '{item.column_name}' dropped successfully from table '{item.table_name}'.")
+        return {"message": f"Column '{item.column_name}' dropped successfully from table '{item.table_name}'."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during drop column: {e}", exc_info=True)
+        error_message_lower = str(e).lower()
+        if ("unknown column" in error_message_lower or "can't drop" in error_message_lower) and not item.if_exists:
+            raise HTTPException(status_code=404, detail=f"Column '{item.column_name}' not found in table '{item.table_name}'.")
+        raise HTTPException(status_code=500, detail=f"Database error during drop column: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during drop column: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during drop column: {e}")
+
+@app.post("/rename_column")
+async def rename_column(item: RenameColumn = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+    connection = None
+
+    try:
+        validate_table_exists(item.table_name, item.credentials)
+        table_to_alter = metadata.tables[item.table_name]
+
+        if item.old_column_name not in table_to_alter.columns:
+            raise HTTPException(status_code=404, detail=f"Column '{item.old_column_name}' not found in table '{item.table_name}'.")
+
+        if item.new_column_name in table_to_alter.columns:
+            raise HTTPException(status_code=409, detail=f"New column name '{item.new_column_name}' already exists in table '{item.table_name}'. Please choose a different name.")
+
+        info_schema_query = text(f"""
+            SELECT
+                COLUMN_NAME,
+                COLUMN_TYPE,
+                IS_NULLABLE,
+                COLUMN_DEFAULT,
+                COLUMN_KEY,
+                EXTRA
+            FROM
+                INFORMATION_SCHEMA.COLUMNS
+            WHERE
+                TABLE_SCHEMA = :db_name AND
+                TABLE_NAME = :table_name AND
+                COLUMN_NAME = :column_name
+        """)
+
+        with engine.connect() as temp_conn:
+            result = temp_conn.execute(info_schema_query, {
+                "db_name": item.credentials.mysql_database,
+                "table_name": item.table_name,
+                "column_name": item.old_column_name
+            }).fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Column '{item.old_column_name}' not found in INFORMATION_SCHEMA for table '{item.table_name}'.")
+
+        old_col_info = {
+            "COLUMN_NAME": result[0],
+            "COLUMN_TYPE": result[1],
+            "IS_NULLABLE": result[2],
+            "COLUMN_DEFAULT": result[3],
+            "COLUMN_KEY": result[4],
+            "EXTRA": result[5]
+        }
+
+        is_primary_key_col = (old_col_info["COLUMN_KEY"] == "PRI")
+        is_auto_increment_col = ("auto_increment" in old_col_info["EXTRA"].lower())
+
+        is_composite_pk = False
+        if table_to_alter.primary_key and len(table_to_alter.primary_key.columns) > 1:
+            pk_column_names = [col.name for col in table_to_alter.primary_key.columns]
+            if item.old_column_name in pk_column_names:
+                is_composite_pk = True
+
+        connection = engine.connect()
+        trans = connection.begin()
+
+        try:
+            if is_primary_key_col and is_auto_increment_col and not is_composite_pk:
+                logger.info(f"Temporarily removing PRIMARY KEY and AUTO_INCREMENT from '{item.old_column_name}' in table '{item.table_name}' for rename.")
+                temp_alter_stmt = text(
+                    f"""ALTER TABLE `{item.table_name}` CHANGE `{item.old_column_name}` `{item.old_column_name}` {old_col_info['COLUMN_TYPE']}"""
+                    f"""{' NOT NULL' if old_col_info['IS_NULLABLE'] == 'NO' else ''}"""
+                    f"""{f' DEFAULT {repr(old_col_info["COLUMN_DEFAULT"])}' if old_col_info['COLUMN_DEFAULT'] is not None else ''}"""
+                )
+                connection.execute(temp_alter_stmt)
+                
+                drop_pk_stmt = text(f"ALTER TABLE `{item.table_name}` DROP PRIMARY KEY")
+                connection.execute(drop_pk_stmt)
+            elif is_primary_key_col and is_composite_pk:
+                 raise HTTPException(status_code=400, detail=f"Cannot rename primary key column '{item.old_column_name}' in table '{item.table_name}'. It is part of a composite primary key. This operation is not supported directly via rename_column endpoint for composite primary keys.")
+
+            column_definition_parts = [
+                f"`{item.new_column_name}`",
+                old_col_info["COLUMN_TYPE"]
+            ]
+
+            if old_col_info["IS_NULLABLE"] == "NO":
+                column_definition_parts.append("NOT NULL")
+            
+            if old_col_info["COLUMN_DEFAULT"] is not None and not is_auto_increment_col:
+                default_val = old_col_info["COLUMN_DEFAULT"]
+                if isinstance(default_val, str) and not (default_val.upper() == 'CURRENT_TIMESTAMP' or default_val.upper().startswith('NULL')):
+                    column_definition_parts.append(f"DEFAULT '{default_val}'")
+                elif default_val is not None:
+                    column_definition_parts.append(f"DEFAULT {default_val}")
+            elif old_col_info["IS_NULLABLE"] == "YES" and old_col_info["COLUMN_DEFAULT"] is None:
+                 column_definition_parts.append("DEFAULT NULL")
+
+            if old_col_info["COLUMN_KEY"] == "UNI":
+                column_definition_parts.append("UNIQUE")
+
+            new_column_definition_sql = " ".join(column_definition_parts)
+
+            alter_table_stmt = text(
+                f"ALTER TABLE `{item.table_name}` CHANGE `{item.old_column_name}` {new_column_definition_sql}"
+            )
+            logger.info(f"Executing column rename: {alter_table_stmt}")
+            connection.execute(alter_table_stmt)
+
+            if is_primary_key_col and is_auto_increment_col and not is_composite_pk:
+                logger.info(f"Re-adding PRIMARY KEY and AUTO_INCREMENT to new column '{item.new_column_name}' for table '{item.table_name}'.")
+                re_add_pk_ai_stmt = text(
+                    f"""ALTER TABLE `{item.table_name}` MODIFY `{item.new_column_name}` {old_col_info['COLUMN_TYPE']}"""
+                    f"""{' NOT NULL' if old_col_info['IS_NULLABLE'] == 'NO' else ''}"""
+                    f"""{f' DEFAULT {repr(old_col_info["COLUMN_DEFAULT"])}' if old_col_info['COLUMN_DEFAULT'] is not None else ''}"""
+                    f""" AUTO_INCREMENT PRIMARY KEY"""
+                )
+                connection.execute(re_add_pk_ai_stmt)
+            elif is_primary_key_col and not is_auto_increment_col and not is_composite_pk:
+                logger.info(f"Re-adding PRIMARY KEY to new column '{item.new_column_name}' for table '{item.table_name}'.")
+                add_pk_stmt = text(f"ALTER TABLE `{item.table_name}` ADD PRIMARY KEY (`{item.new_column_name}`)")
+                connection.execute(add_pk_stmt)
+
+            trans.commit()
+
+        except Exception as inner_e:
+            trans.rollback()
+            raise inner_e
+
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Column '{item.old_column_name}' in table '{item.table_name}' renamed to '{item.new_column_name}' successfully.")
+        return {"message": f"Column '{item.old_column_name}' in table '{item.table_name}' renamed to '{item.new_column_name}' successfully."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during rename column: {e}", exc_info=True)
+        error_message_lower = str(e).lower()
+        if "unknown column" in error_message_lower or "can't rename" in error_message_lower:
+            raise HTTPException(status_code=404, detail=f"Column '{item.old_column_name}' not found in table '{item.table_name}'.")
+        elif "duplicate column name" in error_message_lower:
+            raise HTTPException(status_code=409, detail=f"New column name '{item.new_column_name}' already exists in table '{item.table_name}'. Please choose a different name.")
+        elif "multiple primary key defined" in error_message_lower:
+            raise HTTPException(status_code=400, detail=f"Database error: Cannot rename column '{item.old_column_name}' to '{item.new_column_name}'. The table '{item.table_name}' already has a primary key constraint that conflicts with this operation. This might occur with composite primary keys or if the old column was not the primary key and you are attempting to make the new column a primary key. For composite primary keys, this operation is not supported directly via rename_column endpoint.")
+        elif "incorrect table definition" in error_message_lower and "auto column" in error_message_lower:
+            raise HTTPException(status_code=400, detail=f"Database error: Failed to rename column '{item.old_column_name}' to '{item.new_column_name}'. An AUTO_INCREMENT column must be part of a key. This error typically occurs when attempting to drop a primary key that includes an AUTO_INCREMENT column without first modifying the column's attributes. This specific scenario should now be handled, but if it persists, please verify the table's exact definition.")
+        raise HTTPException(status_code=500, detail=f"Database error during rename column: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during rename column: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during rename column: {e}")
+    finally:
+        if connection:
+            connection.close()
+
+@app.post("/modify_column")
+async def modify_column(item: ModifyColumn = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+    connection = None
+
+    try:
+        validate_table_exists(item.table_name, item.credentials)
+        table_to_alter = metadata.tables[item.table_name]
+
+        if item.column_name not in table_to_alter.columns:
+            raise HTTPException(status_code=404, detail=f"Column '{item.column_name}' not found in table '{item.table_name}'.")
+
+        info_schema_query = text(f"""
+            SELECT
+                COLUMN_NAME,
+                COLUMN_TYPE,
+                IS_NULLABLE,
+                COLUMN_DEFAULT,
+                COLUMN_KEY,
+                EXTRA
+            FROM
+                INFORMATION_SCHEMA.COLUMNS
+            WHERE
+                TABLE_SCHEMA = :db_name AND
+                TABLE_NAME = :table_name AND
+                COLUMN_NAME = :column_name
+        """)
+
+        with engine.connect() as temp_conn:
+            result = temp_conn.execute(info_schema_query, {
+                "db_name": item.credentials.mysql_database,
+                "table_name": item.table_name,
+                "column_name": item.column_name
+            }).fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Column '{item.column_name}' not found in INFORMATION_SCHEMA for table '{item.table_name}'.")
+
+        old_col_info = {
+            "COLUMN_NAME": result[0],
+            "COLUMN_TYPE": result[1],
+            "IS_NULLABLE": result[2],
+            "COLUMN_DEFAULT": result[3],
+            "COLUMN_KEY": result[4],
+            "EXTRA": result[5]
+        }
+
+        is_primary_key_col = (old_col_info["COLUMN_KEY"] == "PRI")
+        is_auto_increment_col = ("auto_increment" in old_col_info["EXTRA"].lower())
+        
+        is_composite_pk = False
+        if table_to_alter.primary_key and len(table_to_alter.primary_key.columns) > 1:
+            pk_column_names = [col.name for col in table_to_alter.primary_key.columns]
+            if item.column_name in pk_column_names:
+                is_composite_pk = True
+
+        connection = engine.connect()
+        trans = connection.begin()
+
+        try:
+            if is_primary_key_col and is_auto_increment_col and not is_composite_pk:
+                logger.info(f"Temporarily removing PRIMARY KEY and AUTO_INCREMENT from '{item.column_name}' in table '{item.table_name}' for modification.")
+                temp_alter_stmt = text(
+                    f"""ALTER TABLE `{item.table_name}` CHANGE `{item.column_name}` `{item.column_name}` {old_col_info['COLUMN_TYPE']}"""
+                    f"""{' NOT NULL' if old_col_info['IS_NULLABLE'] == 'NO' else ''}"""
+                    f"""{f' DEFAULT {repr(old_col_info["COLUMN_DEFAULT"])}' if old_col_info['COLUMN_DEFAULT'] is not None else ''}"""
+                )
+                connection.execute(temp_alter_stmt)
+                
+                drop_pk_stmt = text(f"ALTER TABLE `{item.table_name}` DROP PRIMARY KEY")
+                connection.execute(drop_pk_stmt)
+            elif is_primary_key_col and is_composite_pk:
+                 raise HTTPException(status_code=400, detail=f"Cannot modify primary key column '{item.column_name}' in table '{item.table_name}'. It is part of a composite primary key. This operation is not supported directly via modify_column endpoint for composite primary keys.")
+
+            new_col_def = item.new_column_definition
+            new_column_definition_parts = [
+                f"`{new_col_def.name}`", # Use the name from new_column_definition (should be same as column_name)
+                new_col_def.type # Use the new type
+            ]
+
+            if not new_col_def.nullable:
+                new_column_definition_parts.append("NOT NULL")
+            
+            if new_col_def.default is not None and not new_col_def.autoincrement:
+                default_val = new_col_def.default
+                if isinstance(default_val, str) and not (default_val.upper() == 'CURRENT_TIMESTAMP' or default_val.upper().startswith('NULL')):
+                    new_column_definition_parts.append(f"DEFAULT '{default_val}'")
+                elif default_val is not None:
+                    new_column_definition_parts.append(f"DEFAULT {default_val}")
+            elif new_col_def.nullable and new_col_def.default is None:
+                 new_column_definition_parts.append("DEFAULT NULL")
+
+            if new_col_def.unique:
+                new_column_definition_parts.append("UNIQUE")
+
+            new_column_definition_sql = " ".join(new_column_definition_parts)
+
+            alter_table_stmt = text(
+                f"ALTER TABLE `{item.table_name}` CHANGE `{item.column_name}` {new_column_definition_sql}"
+            )
+            logger.info(f"Executing column modification: {alter_table_stmt}")
+            connection.execute(alter_table_stmt)
+
+            if (is_primary_key_col and is_auto_increment_col and not is_composite_pk) or \
+               (new_col_def.primary_key and new_col_def.autoincrement and not is_primary_key_col):
+                logger.info(f"Re-adding PRIMARY KEY and AUTO_INCREMENT to column '{new_col_def.name}' for table '{item.table_name}'.")
+                re_add_pk_ai_stmt = text(
+                    f"""ALTER TABLE `{item.table_name}` MODIFY `{new_col_def.name}` {new_col_def.type}"""
+                    f"""{' NOT NULL' if not new_col_def.nullable else ''}"""
+                    f"""{f' DEFAULT {repr(new_col_def.default)}' if new_col_def.default is not None else ''}"""
+                    f""" AUTO_INCREMENT PRIMARY KEY"""
+                )
+                connection.execute(re_add_pk_ai_stmt)
+            elif (is_primary_key_col and not is_auto_increment_col and not is_composite_pk) or \
+                 (new_col_def.primary_key and not new_col_def.autoincrement and not is_primary_key_col):
+                logger.info(f"Re-adding PRIMARY KEY to column '{new_col_def.name}' for table '{item.table_name}'.")
+                add_pk_stmt = text(f"ALTER TABLE `{item.table_name}` ADD PRIMARY KEY (`{new_col_def.name}`)")
+                connection.execute(add_pk_stmt)
+
+            trans.commit()
+
+        except Exception as inner_e:
+            trans.rollback()
+            raise inner_e
+
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Column '{item.column_name}' in table '{item.table_name}' modified successfully.")
+        return {"message": f"Column '{item.column_name}' in table '{item.table_name}' modified successfully."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during modify column: {e}", exc_info=True)
+        error_message_lower = str(e).lower()
+        if "unknown column" in error_message_lower or "can't modify" in error_message_lower:
+            raise HTTPException(status_code=404, detail=f"Column '{item.column_name}' not found in table '{item.table_name}'.")
+        elif "incorrect table definition" in error_message_lower and "auto column" in error_message_lower:
+            raise HTTPException(status_code=400, detail=f"Database error: Failed to modify column '{item.column_name}'. An AUTO_INCREMENT column must be part of a key. This error typically occurs when attempting to drop a primary key that includes an AUTO_INCREMENT column without first modifying the column's attributes. This specific scenario should now be handled, but if it persists, please verify the table's exact definition.")
+        elif "multiple primary key defined" in error_message_lower:
+            raise HTTPException(status_code=400, detail=f"Database error: Cannot modify column '{item.column_name}'. The table '{item.table_name}' already has a primary key constraint that conflicts with this operation. This might occur with composite primary keys or if the column was not the primary key and you are attempting to make it a primary key. For composite primary keys, this operation is not supported directly via modify_column endpoint.")
+        raise HTTPException(status_code=500, detail=f"Database error during modify column: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during modify column: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during modify column: {e}")
+    finally:
+        if connection:
+            connection.close()
+
+@app.post("/rename_table")
+async def rename_table(item: RenameTable = Body(...)):
+    engine, metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+    try:
+        validate_table_exists(item.old_table_name, item.credentials)
+        
+        _, current_metadata, _ = get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+        if item.new_table_name in current_metadata.tables:
+            raise HTTPException(status_code=409, detail=f"Table '{item.new_table_name}' already exists. Cannot rename '{item.old_table_name}'.")
+
+        alter_table_stmt = text(
+            f"ALTER TABLE `{item.old_table_name}` RENAME TO `{item.new_table_name}`"
+        )
+
+        with engine.connect() as connection:
+            connection.execute(alter_table_stmt)
+            connection.commit()
+
+        get_engine_metadata_and_session_factory(item.credentials, force_re_reflect=True)
+
+        logger.info(f"Table '{item.old_table_name}' renamed to '{item.new_table_name}' successfully.")
+        return {"message": f"Table '{item.old_table_name}' renamed to '{item.new_table_name}' successfully."}
+
+    except HTTPException as e:
+        raise e
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemy error during table rename: {e}", exc_info=True)
+        error_message_lower = str(e).lower()
+        if "unknown table" in error_message_lower or "doesn't exist" in error_message_lower:
+            raise HTTPException(status_code=404, detail=f"Table '{item.old_table_name}' not found.")
+        elif "table exists" in error_message_lower:
+            raise HTTPException(status_code=409, detail=f"Table '{item.new_table_name}' already exists. Cannot rename '{item.old_table_name}'.")
+        raise HTTPException(status_code=500, detail=f"Database error during table rename: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during table rename: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during table rename: {e}")
+    finally:
+        if connection:
+            connection.close()
