@@ -31,7 +31,7 @@ class Join(BaseModel):
     table: str = Field(..., description="Name of the table to join")
     alias: Optional[str] = Field(None, description="Alias for the joined table")
     on: Dict[str, str] = Field(..., description="Join condition mapping: main_table.column -> joined_table.column")
-    type: Optional[str] = Field("inner", description="Join type", pattern="^(inner|left|right|full)$")
+    type: Optional[str] = Field("inner", description="Join type", pattern="^(inner|left|right|full)$") # ADD 'right' and 'full' here
     columns: Optional[List[str]] = Field(None, description="Columns to select from joined table")
     filters: Optional[JoinFilters] = Field(None, description="Filters for the joined table")
 
@@ -153,3 +153,56 @@ class SchemaRequest(BaseModel):
     mysql_user: str
     mysql_password: str
     include_columns: bool = True
+
+class ColumnDefinition(BaseModel):
+    name: str = Field(..., description="Name of the column")
+    type: str = Field(..., description="SQL data type (e.g., 'VARCHAR(255)', 'INT', 'BOOLEAN', 'DATETIME')")
+    nullable: Optional[bool] = Field(True, description="Whether the column can be NULL")
+    primary_key: Optional[bool] = Field(False, description="Whether the column is part of the primary key")
+    autoincrement: Optional[bool] = Field(False, description="Whether the column is auto-incrementing (e.g., for INT PRIMARY KEY)")
+    default: Optional[Union[str, int, float, bool]] = Field(None, description="Default value for the column")
+    unique: Optional[bool] = Field(False, description="Whether the column must contain unique values")
+
+class CreateTable(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the new table to create")
+    columns: List[ColumnDefinition] = Field(..., min_items=1, description="List of column definitions for the new table")
+    if_not_exists: Optional[bool] = Field(False, description="If True, adds IF NOT EXISTS to the CREATE TABLE statement")
+
+class DropTable(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the table to drop")
+    if_exists: Optional[bool] = Field(False, description="If True, adds IF EXISTS to the DROP TABLE statement")
+
+class TruncateTable(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the table to truncate")
+
+class AddColumn(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the table to alter")
+    column_definition: ColumnDefinition = Field(..., description="Definition of the new column to add")
+    if_not_exists: Optional[bool] = Field(False, description="If True, adds IF NOT EXISTS to the ADD COLUMN statement (MySQL specific)")
+
+class DropColumn(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the table to alter")
+    column_name: str = Field(..., description="Name of the column to drop")
+    if_exists: Optional[bool] = Field(False, description="If True, adds IF EXISTS to the DROP COLUMN statement (MySQL specific)")
+
+class RenameColumn(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the table containing the column to rename")
+    old_column_name: str = Field(..., description="Current name of the column")
+    new_column_name: str = Field(..., description="New name for the column")
+
+class ModifyColumn(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    table_name: str = Field(..., description="Name of the table containing the column to modify")
+    column_name: str = Field(..., description="Name of the column to modify")
+    new_column_definition: ColumnDefinition = Field(..., description="The new definition for the column (type, nullability, default, etc.)")
+
+class RenameTable(BaseModel):
+    credentials: DatabaseCredentials = Field(..., description="Database connection credentials")
+    old_table_name: str = Field(..., description="Current name of the table to rename")
+    new_table_name: str = Field(..., description="New name for the table")
