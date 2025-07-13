@@ -12,8 +12,8 @@ class DatabaseCredentials(BaseModel):
 # Model for a single filter condition
 class FilterCondition(BaseModel):
     column: str = Field(..., description="Column name, optionally prefixed with table or alias")
-    operator: str = Field(..., description="Comparison operator", pattern="^(eq|neq|gt|gte|lt|lte|like|in|nin)$")
-    value: Union[str, int, float, List[Union[str, int, float]]] = Field(..., description="Value or list of values for 'in'/'nin'")
+    operator: str = Field(..., description="Comparison operator", pattern="^(eq|neq|gt|gte|lt|lte|like|in|nin|is_null|is_not_null)$") # ADD is_null|is_not_null
+    value: Union[str, int, float, List[Union[str, int, float]], None] = Field(..., description="Value or list of values for 'in'/'nin'. For 'is_null'/'is_not_null', this should be null.") # ADD None to Union, update description
 
 # Model for compound filters (recursive)
 class Filters(BaseModel):
@@ -45,6 +45,7 @@ class Aggregation(BaseModel):
     function: str = Field(..., description="Aggregation function", pattern="^(count|sum|avg|min|max)$")
     column: Optional[str] = Field(None, description="Column name (optional for count(*))")
     alias: str = Field(..., description="Alias for the aggregated column in the result")
+    distinct: Optional[bool] = Field(False, description="Whether to count only distinct values. Relevant for 'count' function.")
 
 # Main query model
 class Query(BaseModel):
@@ -58,10 +59,9 @@ class Query(BaseModel):
     order_by: Optional[List[OrderBy]] = Field(None, description="Sorting instructions")
     limit: Optional[int] = Field(None, ge=1, description="Limit number of records")
     offset: Optional[int] = Field(0, ge=0, description="Number of records to skip")
-
-    # Add these new fields for aggregation and grouping
     aggregations: Optional[List[Aggregation]] = Field(None, description="List of aggregation specifications")
     group_by: Optional[List[str]] = Field(None, description="List of columns to group by")
+    having: Optional[Filters] = Field(None, description="Filter conditions to apply to aggregated results (HAVING clause). Use with 'group_by'.")
 
     # Corrected validators
     @validator('group_by', always=True)
