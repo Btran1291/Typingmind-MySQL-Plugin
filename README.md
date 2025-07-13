@@ -10,7 +10,7 @@ This server is designed to work with the following TypingMind plugins. You will 
 
 1. [**MySQL Schema**](https://cloud.typingmind.com/plugins/p-01JZPTRSR34C5WZ49KT1VKSSB0)  
 
-2. [**MySQL Query**](https://cloud.typingmind.com/plugins/p-01JZPTSC33PV6AJVTTWGH9KPGP)  
+2. [**MySQL Query**](https://cloud.typingmind.com/plugins/p-01K02NK8QMCTTAS3GJ2ZXGFCT2)  
 
 3. [**MySQL CRUD Operation**](https://cloud.typingmind.com/plugins/p-01JZPTSXS1JZD0J5YPNRKVR8PV)  
 
