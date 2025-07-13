@@ -2,7 +2,7 @@ import logging
 import traceback
 import re
 from fastapi import FastAPI, Depends, HTTPException, Body
-from sqlalchemy import create_engine, MetaData, Table, select, and_, or_, text, func
+from sqlalchemy import create_engine, MetaData, Table, select, and_, or_, text, func, distinct
 from sqlalchemy.orm import sessionmaker, Session, aliased
 from sqlalchemy.sql import operators
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, OperationalError, ProgrammingError
@@ -91,6 +91,7 @@ def get_engine_metadata_and_session_factory(credentials: DatabaseCredentials, fo
                     logger.info(f"Creating new engine for {log_connection_url_safe}")
                     engine = create_engine(
                         connection_url,
+    			echo=True,
                         pool_pre_ping=True,
                         pool_size=5,
                         max_overflow=10,
@@ -146,24 +147,31 @@ def validate_columns_exist(
     alias_map: Dict[str, Table],
     main_table: Table,
     credentials: DatabaseCredentials,
-    context: str = "columns"
+    context: str = "columns",
+    agg_alias_map: Optional[Dict[str, Any]] = None
 ):
     for col_name in columns:
         try:
-            get_column_from_alias_map(col_name, alias_map, main_table, credentials)
+            get_column_or_agg_expression(col_name, alias_map, main_table, credentials, agg_alias_map)
         except HTTPException as e:
             raise HTTPException(status_code=e.status_code, detail=f"Column '{col_name}' in {context} validation failed: {e.detail}")
         except Exception as e:
              raise HTTPException(status_code=500, detail=f"Unexpected error validating column '{col_name}' in {context}: {e}")
 
-def validate_filters_exist(filters: Optional[Filters], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
+def validate_filters_exist(
+    filters: Optional[Filters],
+    alias_map: Dict[str, Table],
+    main_table: Table,
+    credentials: DatabaseCredentials,
+    agg_alias_map: Optional[Dict[str, Any]] = None # ADD THIS PARAMETER
+):
     if not filters:
         return
     for cond in filters.conditions:
         if isinstance(cond, Filters):
-            validate_filters_exist(cond, alias_map, main_table, credentials)
+            validate_filters_exist(cond, alias_map, main_table, credentials, agg_alias_map)
         elif isinstance(cond, FilterCondition):
-            validate_columns_exist([cond.column], alias_map, main_table, credentials, context="filter")
+            validate_columns_exist([cond.column], alias_map, main_table, credentials, context="filter", agg_alias_map=agg_alias_map)
 
 def validate_insert_data_columns(data: Dict[str, Any], table: Table):
     """
@@ -245,6 +253,16 @@ def get_column_from_alias_map(col_name: str, alias_map: Dict[str, Table], main_t
 
 def build_filter_condition_with_alias_map(condition: FilterCondition, alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     col = get_column_from_alias_map(condition.column, alias_map, main_table, credentials)
+
+    if condition.operator == "is_null":
+        if condition.value is not None:
+            raise HTTPException(status_code=400, detail=f"Operator '{condition.operator}' does not require a value. Value must be null.")
+        return col.is_(None)
+    elif condition.operator == "is_not_null":
+        if condition.value is not None:
+            raise HTTPException(status_code=400, detail=f"Operator '{condition.operator}' does not require a value. Value must be null.")
+        return col.isnot(None)
+
     op_func = OPERATOR_MAP.get(condition.operator)
     if op_func is None:
         raise HTTPException(status_code=400, detail=f"Unsupported operator: '{condition.operator}'.")
@@ -257,15 +275,52 @@ def build_filter_condition_with_alias_map(condition: FilterCondition, alias_map:
         val = f"%{val}%"
     return op_func(col, val)
 
-def build_filters_with_alias_map(filters: Filters, alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
+def get_column_or_agg_expression(
+    col_name: str,
+    alias_map: Dict[str, Table],
+    main_table: Table,
+    credentials: DatabaseCredentials,
+    agg_alias_map: Optional[Dict[str, Any]] = None
+):
+    logger.info(f"get_column_or_agg_expression: Resolving '{col_name}'. agg_alias_map keys: {agg_alias_map.keys() if agg_alias_map else 'None'}") # ADD THIS LINE
+
+    if agg_alias_map and col_name in agg_alias_map:
+        logger.info(f"get_column_or_agg_expression: Resolved '{col_name}' as aggregation alias.") # ADD THIS LINE
+        return agg_alias_map[col_name]
+    return get_column_from_alias_map(col_name, alias_map, main_table, credentials)
+
+def build_filters_with_alias_map(
+    filters: Filters,
+    alias_map: Dict[str, Table],
+    main_table: Table,
+    credentials: DatabaseCredentials,
+    agg_alias_map: Optional[Dict[str, Any]] = None
+):
+    logger.info(f"build_filters_with_alias_map: Received agg_alias_map keys: {agg_alias_map.keys() if agg_alias_map else 'None'}")
     if not filters or not filters.conditions:
         return text("1=1")
     conditions = []
     for cond in filters.conditions:
         if isinstance(cond, Filters):
-            conditions.append(build_filters_with_alias_map(cond, alias_map, main_table, credentials))
+            conditions.append(build_filters_with_alias_map(cond, alias_map, main_table, credentials, agg_alias_map))
         elif isinstance(cond, FilterCondition):
-            conditions.append(build_filter_condition_with_alias_map(cond, alias_map, main_table, credentials))
+            col = get_column_or_agg_expression(cond.column, alias_map, main_table, credentials, agg_alias_map)
+            op_func = OPERATOR_MAP.get(cond.operator)
+            if cond.operator == "is_null":
+                conditions.append(col.is_(None))
+            elif cond.operator == "is_not_null":
+                conditions.append(col.isnot(None))
+            else:
+                val = cond.value
+                if cond.operator in ("in", "nin") and not isinstance(val, list):
+                    raise HTTPException(status_code=400, detail=f"Operator '{cond.operator}' requires a list value.")
+                if cond.operator == "like" and not isinstance(val, str):
+                    raise HTTPException(status_code=400, detail=f"Operator 'like' requires a string value.")
+                if cond.operator == "like" and '%' not in val and '_' not in val:
+                    val = f"%{val}%"
+                if op_func is None:
+                    raise HTTPException(status_code=400, detail=f"Unsupported operator: '{cond.operator}'.")
+                conditions.append(op_func(col, val))
         else:
             raise HTTPException(status_code=400, detail=f"Invalid filter condition type: {type(cond)}")
     if filters.logic == "and":
@@ -316,22 +371,30 @@ def apply_order_by(stmt, order_by_list: Optional[List[OrderBy]], alias_map: Dict
             raise HTTPException(status_code=400, detail=f"Invalid order direction: {order.direction}")
     return stmt.order_by(*order_clauses)
 
-
 def build_aggregation_clauses(aggregations: List[Aggregation], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     agg_clauses = []
     for agg in aggregations:
-        if agg.function.lower() == "count" and agg.column is None:
-            col = func.count()
+        logger.info(f"Processing aggregation: function={agg.function}, column={agg.column}, distinct={agg.distinct}")
+        if agg.function.lower() == "count":
+            if agg.column is None:
+                col = func.count()
+            else:
+                target_col = get_column_from_alias_map(agg.column, alias_map, main_table, credentials)
+                if agg.distinct:
+                    col = func.count(distinct(target_col))  # <-- Change here
+                else:
+                    col = func.count(target_col)
         elif agg.column:
-            col = get_column_from_alias_map(agg.column, alias_map, main_table, credentials)
+            target_col = get_column_from_alias_map(agg.column, alias_map, main_table, credentials)
             agg_func = getattr(func, agg.function.lower(), None)
             if agg_func is None:
                 raise HTTPException(status_code=400, detail=f"Unsupported aggregation function: '{agg.function}'.")
-            col = agg_func(col)
+            col = agg_func(target_col)
         else:
             raise HTTPException(status_code=400, detail=f"Column is required for aggregation function '{agg.function}'.")
         agg_clauses.append(col.label(agg.alias))
     return agg_clauses
+
 
 def build_group_by_clauses(group_by_cols: List[str], alias_map: Dict[str, Table], main_table: Table, credentials: DatabaseCredentials):
     group_by_clauses = []
@@ -404,6 +467,8 @@ async def run_query(query: Query = Body(...)):
         main_table = get_table(query.table, query.credentials)
 
         alias_map = {main_table.name: main_table}
+        agg_alias_map = {}
+
         if query.joins:
             for join in query.joins:
                 validate_table_exists(join.table, query.credentials)
@@ -414,29 +479,39 @@ async def run_query(query: Query = Body(...)):
 
         validate_filters_exist(query.filters, alias_map, main_table, query.credentials)
 
-        if query.group_by:
-            validate_columns_exist(query.group_by, alias_map, main_table, query.credentials, context="group_by")
+        is_aggregating = query.aggregations is not None and len(query.aggregations) > 0
+        is_grouping = query.group_by is not None and len(query.group_by) > 0
+
+        group_by_clauses = []
+        if is_aggregating or is_grouping:
+            if is_grouping:
+                validate_columns_exist(query.group_by, alias_map, main_table, query.credentials, context="group_by")
+                group_by_clauses = build_group_by_clauses(query.group_by, alias_map, main_table, query.credentials)
+            if is_aggregating:
+                agg_clauses = build_aggregation_clauses(query.aggregations, alias_map, main_table, query.credentials)
+                agg_alias_map = {agg.alias: expr for agg, expr in zip(query.aggregations, agg_clauses)}
+                logger.info(f"run_query: Populated agg_alias_map: {agg_alias_map.keys()}")
+
+        if query.having:
+            if not is_grouping and not is_aggregating:
+                raise HTTPException(status_code=400, detail="A 'having' clause requires 'aggregations' or 'group_by' to be specified.")
+            validate_filters_exist(query.having, alias_map, main_table, query.credentials, agg_alias_map=agg_alias_map)
 
         if query.order_by:
             order_by_cols = [order.column for order in query.order_by]
-            validate_columns_exist(order_by_cols, alias_map, main_table, query.credentials, context="order_by")
+            validate_columns_exist(order_by_cols, alias_map, main_table, query.credentials, context="order_by", agg_alias_map=agg_alias_map)
 
         if query.aggregations:
             agg_cols = [agg.column for agg in query.aggregations if agg.column]
             if agg_cols:
-                validate_columns_exist(agg_cols, alias_map, main_table, query.credentials, context="aggregations")
+                validate_columns_exist(agg_cols, alias_map, main_table, query.credentials, context="aggregations", agg_alias_map=agg_alias_map)
 
         select_items = []
-        is_aggregating = query.aggregations is not None and len(query.aggregations) > 0
-        is_grouping = query.group_by is not None and len(query.group_by) > 0
-
         if is_aggregating or is_grouping:
             if is_grouping:
-                group_by_clauses = build_group_by_clauses(query.group_by, alias_map, main_table, query.credentials)
                 select_items.extend(group_by_clauses)
             if is_aggregating:
-                agg_clauses = build_aggregation_clauses(query.aggregations, alias_map, main_table, query.credentials)
-                select_items.extend(agg_clauses)
+                select_items.extend(list(agg_alias_map.values()))
             if query.columns is not None and len(query.columns) > 0:
                 raise HTTPException(status_code=400, detail="The 'columns' field cannot be used when 'aggregations' or 'group_by' are specified. Selected columns are defined by 'group_by' and 'aggregations'.")
         else:
@@ -451,10 +526,15 @@ async def run_query(query: Query = Body(...)):
             stmt = apply_joins(stmt, main_table, query.joins, alias_map, query.credentials)
 
         if query.filters:
-            stmt = stmt.where(build_filters_with_alias_map(query.filters, alias_map, main_table, query.credentials))
+            stmt = stmt.where(build_filters_with_alias_map(query.filters, alias_map, main_table, query.credentials, agg_alias_map=agg_alias_map))
 
         if is_grouping:
-             stmt = stmt.group_by(*group_by_clauses)
+            stmt = stmt.group_by(*group_by_clauses)
+
+        if query.having:
+            logger.info(f"run_query: Calling build_filters_with_alias_map for HAVING. agg_alias_map keys: {agg_alias_map.keys()}")
+            having_condition = build_filters_with_alias_map(query.having, alias_map, main_table, query.credentials, agg_alias_map=agg_alias_map)
+            stmt = stmt.having(having_condition)
 
         if query.order_by:
             stmt = apply_order_by(stmt, query.order_by, alias_map, main_table, query.credentials)
@@ -463,6 +543,8 @@ async def run_query(query: Query = Body(...)):
             stmt = stmt.limit(query.limit)
         if query.offset:
             stmt = stmt.offset(query.offset)
+
+        logger.info(f"Final Generated SQL Statement: {stmt.compile(engine)}")
 
         result = db.execute(stmt)
 
@@ -476,13 +558,13 @@ async def run_query(query: Query = Body(...)):
         logger.error(f"Unexpected error during query execution: {e}", exc_info=True)
         detail = str(e)
         if "1055" in detail or "GROUP BY" in detail:
-             detail = "Query error: SELECT list contains nonaggregated column which is not included in GROUP BY clause."
+            detail = "Query error: SELECT list contains nonaggregated column which is not included in GROUP BY clause."
         elif "Unknown column" in detail:
-             detail = f"Query error: {detail}"
+            detail = f"Query error: {detail}"
         elif "syntax error" in detail:
-             detail = f"Query error: {detail}"
+            detail = f"Query error: {detail}"
         else:
-             detail = "An internal server error occurred."
+            detail = "An internal server error occurred."
 
         raise HTTPException(status_code=500, detail=detail)
     finally:
